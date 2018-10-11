@@ -69,6 +69,8 @@ using dnn::NormalizeDescriptor;
 
 namespace rocm {
 
+const int kVlogLevel = -1;
+
 PLUGIN_REGISTRY_DEFINE_PLUGIN_ID(kMIOpenPlugin);
 
 string ToString(miopenStatus_t status) {
@@ -329,15 +331,41 @@ class CachedFusionPlans {
     }
 
     cachedPlans.clear();
+
+    unsupportedPlans.clear();
   }
 
+  // is the Fusion plan corresponding to this hash unsupported
+  static bool isUnsupportedFusionPlan(uint64 hash) {
+    mutex_lock lock{cachedPlansMutex};
+    return unsupportedPlans.count(hash) > 0;
+  }
+
+
+  // mark the given hash value as corresponding to an unsupported fusion plan
+  static void markFusionPlanUnsupported(uint64 hash) {
+    mutex_lock lock{cachedPlansMutex};
+    unsupportedPlans.insert(hash);
+  }
+
+  
  private:
+
+  // mutex to guard access to all data within this class
   static mutex cachedPlansMutex;
+
+  // map of hash-value to MIOpen Fusion plan descriptors
+  // need to be able share this across more than one stream and hence static
   static std::map<uint64, miopenFusionPlanDescriptor_t> cachedPlans;
+
+  // set of hash-values that correspond to MIOpen Fusion plans that will fail
+  // compile and hence are not supported.
+  static std::set<uint64> unsupportedPlans;
 };
 
 mutex CachedFusionPlans::cachedPlansMutex;
 std::map<uint64, miopenFusionPlanDescriptor_t> CachedFusionPlans::cachedPlans;
+std::set<uint64> CachedFusionPlans::unsupportedPlans;
 
 }  // namespace
 
@@ -821,7 +849,8 @@ class ScopedFusionPlanBase {
       : parent_(parent),
         miopen_handle_(miopen_handle),
         fusion_plan_(nullptr),
-        fusion_args_(nullptr) {
+        fusion_args_(nullptr),
+	fusion_plan_compiled_(false) {
     miopenStatus_t status =
         wrap::miopenCreateOperatorArgs(parent_, &fusion_args_);
     if (status != miopenStatusSuccess) {
@@ -854,6 +883,8 @@ class ScopedFusionPlanBase {
     return status;
   }
 
+  bool CompilationSucceeded() { return fusion_plan_compiled_; }
+  
  protected:
   miopenStatus_t SetConvolutionArgs(const int op_idx, const float* alpha,
                                     const float* beta, const void* data) {
@@ -918,7 +949,8 @@ class ScopedFusionPlanBase {
   miopenHandle_t miopen_handle_;
   miopenFusionPlanDescriptor_t fusion_plan_;
   miopenOperatorArgs_t fusion_args_;  // Owned.
-
+  bool fusion_plan_compiled_;
+  
   SE_DISALLOW_COPY_AND_ASSIGN(ScopedFusionPlanBase);
 };
 
@@ -978,9 +1010,19 @@ class ScopedFusionPlanConvolutionBiasActivation : public ScopedFusionPlanBase {
       status =
           wrap::miopenCompileFusionPlan(parent_, miopen_handle_, fusion_plan_);
       if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenCompileFusionPlan (CBA) failed: "
-                   << ToString(status);
+        VLOG(kVlogLevel) << "call to miopenCompileFusionPlan (CBA) failed: "
+			 << ToString(status);
+
+	CachedFusionPlans::markFusionPlanUnsupported(hash);
       }
+      else {
+        VLOG(kVlogLevel) << "Fusion Plan compile succedded (CBA) ";
+	fusion_plan_compiled_ = true;
+      }
+    }
+    else {
+      // fusion plan was already compiled...check whether it failed to compile
+      fusion_plan_compiled_ = !CachedFusionPlans::isUnsupportedFusionPlan(hash);
     }
   }
 
@@ -4001,54 +4043,60 @@ bool MIOpenSupport::DoFusedConvolutionBiasActivationImpl(
       bias_nd.handle(),
       activation_desc.handle()};
 
-  const bool is_profiling = output_profile_result != nullptr;
+  bool retval = false;
+  
+  if (fusion_plan.CompilationSucceeded()) {
+    
+    const bool is_profiling = output_profile_result != nullptr;
 
-  std::unique_ptr<ROCMTimer> timer;
-  if (is_profiling) {
-    timer.reset(new ROCMTimer(parent_));
-    timer->Init();
-    timer->Start(AsROCMStream(stream));
-  }
+    std::unique_ptr<ROCMTimer> timer;
+    if (is_profiling) {
+      timer.reset(new ROCMTimer(parent_));
+      timer->Init();
+      timer->Start(AsROCMStream(stream));
+    }
 
-  miopenStatus_t status = miopenStatusSuccess;
+    miopenStatus_t status = miopenStatusSuccess;
 
-  if (status == miopenStatusSuccess) {
-    fusion_plan.SetConvolutionArgs(filter_data.opaque());
-  }
+    if (status == miopenStatusSuccess) {
+      fusion_plan.SetConvolutionArgs(filter_data.opaque());
+    }
 
-  if (status == miopenStatusSuccess) {
-    status = fusion_plan.SetBiasArgs(bias_data.opaque());
-  }
+    if (status == miopenStatusSuccess) {
+      status = fusion_plan.SetBiasArgs(bias_data.opaque());
+    }
 
-  if (status == miopenStatusSuccess) {
-    status = fusion_plan.SetActivationArgs(activation_desc.handle());
-  }
+    if (status == miopenStatusSuccess) {
+      status = fusion_plan.SetActivationArgs(activation_desc.handle());
+    }
 
-  if (status == miopenStatusSuccess) {
-    status =
+    if (status == miopenStatusSuccess) {
+      status =
         fusion_plan.Execute(conv_input_nd.handle(), conv_input_data.opaque(),
                             output_nd.handle(), output_data->opaque());
-  }
-
-  if (is_profiling) {
-    timer->Stop(AsROCMStream(stream));
-    if (status == miopenStatusSuccess) {
-      output_profile_result->set_elapsed_time_in_ms(
-          timer->GetElapsedMilliseconds());
     }
-    timer->Destroy();
-  }
 
-  if (status != miopenStatusSuccess) {
-    // Silently return when we are profiling.
-    if (!is_profiling) {
-      LOG(FATAL) << "failed to enqueue fused-convolution on stream: "
-		 << ToString(status);
+    if (is_profiling) {
+      timer->Stop(AsROCMStream(stream));
+      if (status == miopenStatusSuccess) {
+	output_profile_result->set_elapsed_time_in_ms(
+						      timer->GetElapsedMilliseconds());
+      }
+      timer->Destroy();
     }
-    return false;
+
+    if (status != miopenStatusSuccess) {
+      // Silently return when we are profiling.
+      if (!is_profiling) {
+	LOG(FATAL) << "failed to enqueue fused-convolution on stream: "
+		   << ToString(status);
+      }
+    }
+
+    retval = true;
   }
 
-  return true;
+  return retval;
 }
 
 bool MIOpenSupport::DoFusedConvolutionBiasActivation(

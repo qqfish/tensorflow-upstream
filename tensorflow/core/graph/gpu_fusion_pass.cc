@@ -63,7 +63,8 @@ const char* kAttr_padding = "padding";
 const char* kAttr_data_format = "data_format";
 const char* kAttr_dilations = "dilations";
 const char* kAttr_activation_mode = "activation_mode";
-
+const char* kAttr_is_training = "is_training";
+  
 const char* kGPUDeviceStr = "GPU";
 
 //----------------------------------------------------------------------
@@ -73,12 +74,14 @@ const char* kGPUDeviceStr = "GPU";
 std::ostream& operator<<(std::ostream& out, const Node* n) {
   out << "id : " << n->id() << ", name : " << n->name()
       << ", type_string : " << n->type_string()
-      // << ", num_inputs : " << n->num_inputs()
-      // << ", num_input_edges : " << n->in_edges().size()
-      // << ", num_outputs : " << n->num_outputs()
-      // << ", num_output_edges : " << n->out_edges().size()
-      << ", assigned_device : "
-      << (n->has_assigned_device_name() ? n->assigned_device_name() : "None");
+      << ", num_inputs : " << n->num_inputs()
+      << ", num_input_edges : " << n->in_edges().size()
+      << ", num_outputs : " << n->num_outputs()
+      << ", num_output_edges : " << n->out_edges().size()
+      // << ", requested_device : " << n->requested_device()
+      // << ", assigned_device : "
+      // << (n->has_assigned_device_name() ? n->assigned_device_name() : "None")
+    ;
 
   return out;
 }
@@ -90,6 +93,25 @@ void DumpNodeList(int lvl, string message, std::list<const Node*> nodes) {
   }
 }
 
+void DumpOutputEdges(int lvl, const Node* node) {
+  for (const Edge* e : node->out_edges()) {
+    VLOG(lvl)
+      << "\t" << e->src_output()
+      << " : " << e->dst()->name() << e->dst()->type_string();
+  }
+}
+  
+void DumpGraph(int lvl, StringPiece label, const Graph* g) {
+  
+  VLOG(lvl) << "Graph " << label
+	    << " #nodes " << g->num_nodes()
+	    << " #edges " << g->num_edges();
+
+  for (const auto& line : str_util::Split(DebugString(g), '\n')) {
+    VLOG(lvl) << "|| " << line;
+  }
+}
+  
 bool isGpuDevice(StringPiece fullname) {
   DeviceNameUtils::ParsedName p;
   return (DeviceNameUtils::ParseFullName(fullname, &p) &&
@@ -277,8 +299,8 @@ class ROCmFusionOpBatchNormActivation : public ROCmFusionOpBase {
 //----------------------------------------------------------------------
 
 Status ROCmFusionPass::Run(const GraphOptimizationPassOptions& options) {
-  // enable the fusion pass if the env var TF_ROCM_ENABLE_FUSION is set
-  const char* enable_fusion = getenv("TF_ROCM_ENABLE_FUSION");
+  // enable the fusion pass if the env var TF_ROCM_FUSION_ENABLE is set
+  const char* enable_fusion = getenv("TF_ROCM_FUSION_ENABLE");
   if (enable_fusion != nullptr) {
     // Check if the graph is present, should be either in
     // - options.graph (for all but POST_PARTITIONING grouping)
@@ -316,7 +338,10 @@ Status ROCmFusionPass::Run(const GraphOptimizationPassOptions& options) {
 }
 
 bool ROCmFusionPass::RunPass(Graph* graph) {
-  // DumpGraph("Before running ROCmFusionPass", &**g);
+
+  if (getenv("TF_ROCM_FUSION_DUMP_GRAPH_BEFORE")) {
+    DumpGraph(kVlogLevel, "Before running ROCmFusionPass", &*graph);
+  }
 
   std::vector<std::unique_ptr<ROCmFusionOpBase> > fusions;
   std::set<const Node*> fused_nodes;
@@ -346,7 +371,10 @@ bool ROCmFusionPass::RunPass(Graph* graph) {
     }
   }
 
-  // DumpGraph("After running ROCmFusionPass", &**g);
+  if (getenv("TF_ROCM_FUSION_DUMP_GRAPH_AFTER")) {
+    DumpGraph(kVlogLevel, "After running ROCmFusionPass", &*graph);
+  }
+  
   return true;
 }
 
@@ -733,6 +761,24 @@ bool ROCmFusionOpBatchNormActivation::IsFusionEligible(const Node* n2,
     is_eligible = false;
   }
 
+  // check that the is_training attribute is false for the batch-norm op
+  if (is_eligible) {
+    
+    DumpOutputEdges(kVlogLevel, d->norm);
+  
+    bool is_training = true;
+    TF_CHECK_OK(GetNodeAttr(d->norm->def(), kAttr_is_training, &is_training));
+    if (is_training) {
+      VLOG(kVlogLevel)
+	<< "\tSkipping Fusion : "
+	<< "BatchNorm op has the \"is_training\" attribute set to true";
+      VLOG(kVlogLevel) << "===========";
+      is_eligible = false;
+    }
+  }
+
+  // double check that the 
+  
   return is_eligible;
 }
 

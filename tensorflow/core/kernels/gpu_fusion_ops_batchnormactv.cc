@@ -52,7 +52,7 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
 
     float epsilon;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("epsilon", &epsilon));
-    epsilon_ = T(epsilon);
+    epsilon_ = epsilon;
     
     string data_format_str;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format_str));
@@ -66,30 +66,30 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
   }
 
   void Compute(OpKernelContext* ctx) override {
-    /*
+
     const Tensor& x = ctx->input(0);
     const Tensor& scale = ctx->input(1);
     const Tensor& offset = ctx->input(2);
     const Tensor& mean = ctx->input(3);
     const Tensor& variance = ctx->input(4);
 
-    OP_REQURIES_OK(ctx, x.dims() == 4, errors::InvalidArgument("input must be 4-dimensional", x.shape().DebugString()));
-    OP_REQURIES_OK(ctx, scale.dims() == 1, errors::InvalidArgument("scale must be 1-dimensional", scale.shape().DebugString()));
-    OP_REQURIES_OK(ctx, offset.dims() == 1, errors::InvalidArgument("offset must be 1-dimensional", offset.shape().DebugString()));
-    OP_REQURIES_OK(ctx, mean.dims() == 1, errors::InvalidArgument("mean must be 1-dimensional", mean.shape().DebugString()));
-    OP_REQURIES_OK(ctx, variance.dims() == 1, errors::InvalidArgument("variance must be 1-dimensional", variance.shape().DebugString()));
+    OP_REQUIRES(ctx, x.dims() == 4, errors::InvalidArgument("input must be 4-dimensional", x.shape().DebugString()));
+    OP_REQUIRES(ctx, scale.dims() == 1, errors::InvalidArgument("scale must be 1-dimensional", scale.shape().DebugString()));
+    OP_REQUIRES(ctx, offset.dims() == 1, errors::InvalidArgument("offset must be 1-dimensional", offset.shape().DebugString()));
+    OP_REQUIRES(ctx, mean.dims() == 1, errors::InvalidArgument("mean must be 1-dimensional", mean.shape().DebugString()));
+    OP_REQUIRES(ctx, variance.dims() == 1, errors::InvalidArgument("variance must be 1-dimensional", variance.shape().DebugString()));
 
     Tensor* y = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, x.shape, &y));
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, x.shape(), &y));
 
 
-    cont int64 batch_size = GetTensorDim(x, data_format_, 'N')
-    cont int64 height = GetTensorDim(x, data_format_, 'H')
-    cont int64 width = GetTensorDim(x, data_format_, 'W')
-    cont int64 channels = GetTensorDim(x, data_format_, 'C')
+    const int64 batch_size = GetTensorDim(x, data_format_, 'N');
+    const int64 height = GetTensorDim(x, data_format_, 'H');
+    const int64 width = GetTensorDim(x, data_format_, 'W');
+    const int64 channels = GetTensorDim(x, data_format_, 'C');
 
 
-    if (x.num_elements() != 0) {
+    if (x.shape().num_elements() != 0) {
       
       Tensor fusion_input = x;
       Tensor fusion_output = *y;
@@ -118,7 +118,7 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
         // allocate a temporary tensor to store the NCHW output
         Tensor transformed_output;
         TensorShape nchw_shape_output = ShapeFromFormat(
-            FORMAT_NCHW, batch_size, output_rows, output_cols, output_channels);
+            FORMAT_NCHW, batch_size, height, width, channels);
         OP_REQUIRES_OK(
             ctx, ctx->allocate_temp(DataTypeToEnum<T>::value, nchw_shape_output,
                                     &transformed_output));
@@ -135,8 +135,8 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
           .set_layout(se::dnn::DataLayout::kBatchDepthYX);
 
 
-      se::dnn::BatchDescriptor scale_offset_desc;
-      scale_offset_desc.set_count(1)
+      se::dnn::BatchDescriptor scale_offset_mean_variance_desc;
+      scale_offset_mean_variance_desc.set_count(1)
           .set_feature_map_count(channels)
           .set_height(1)
           .set_width(1)
@@ -147,10 +147,21 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
           AsDeviceMemory(fusion_input.template flat<T>().data(),
                          fusion_input.template flat<T>().size());
       auto scale_data =
-          AsDeviceMemory(fusion_filter.template flat<T>().data(),
-                         fusion_filter.template flat<T>().size());
-      auto offset_data = AsDeviceMemory(fusion_bias.template flat<T>().data(),
-                                      fusion_bias.template flat<T>().size());
+          AsDeviceMemory(scale.template flat<T>().data(),
+                         scale.template flat<T>().size());
+      
+      auto offset_data =
+      AsDeviceMemory(offset.template flat<T>().data(),
+		     offset.template flat<T>().size());
+      
+      auto mean_data =
+      AsDeviceMemory(mean.template flat<T>().data(),
+		     mean.template flat<T>().size());
+      
+      auto variance_data =
+      AsDeviceMemory(variance.template flat<T>().data(),
+		     variance.template flat<T>().size());
+      
       auto dnn_activation_mode = GetDnnActivationMode(activation_mode_);
 
       auto y_data =
@@ -162,8 +173,9 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
       bool miopen_status =
           stream
               ->ThenFusedBatchNormActivationInference(
-                  output_desc, &output_data)
-              .ok();
+						      x_desc, x_data, scale_offset_mean_variance_desc,
+						      scale_data, offset_data, mean_data, variance_data, epsilon_,
+						      dnn_activation_mode, &y_data).ok();
 
       if (!miopen_status) {
         ctx->SetStatus(errors::Internal("MIOpen BnA (inference) FusionOp launch Failure"));
@@ -175,15 +187,14 @@ class ROCmFusionKernelBatchNormActivationInference : public OpKernel {
         functor::NCHWToNHWC<GPUDevice, T, 4>()(
             ctx->eigen_device<GPUDevice>(),
             const_cast<const Tensor&>(fusion_output).tensor<T, 4>(),
-            output->tensor<T, 4>());
+            y->tensor<T, 4>());
       }
     }
 
-    */
   }
 
  private:
-  T epsilon_;
+  double epsilon_;
   TensorFormat data_format_;
   ActivationMode activation_mode_;
 };

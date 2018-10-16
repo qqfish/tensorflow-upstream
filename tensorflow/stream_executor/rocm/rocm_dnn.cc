@@ -4255,6 +4255,109 @@ bool MIOpenSupport::DoFusedConvolutionBiasActivation(
       output_profile_result);
 }
 
+template <typename T>
+bool MIOpenSupport::DoFusedBatchNormActivationInferenceImpl(
+    Stream* stream,
+    int miopen_type,  // Actually miopenDataType_t.
+    const dnn::BatchDescriptor& x_descriptor, const DeviceMemory<T>& x_data,
+    const dnn::BatchDescriptor& scale_offset_mean_variance_descriptor,
+    const DeviceMemory<T>& scale_data,
+    const DeviceMemory<T>& offset_data,
+    const DeviceMemory<T>& mean_data,
+    const DeviceMemory<T>& variance_data,
+    double epsilon,
+    dnn::ActivationMode activation_mode,
+    DeviceMemory<T>* y_data,
+    dnn::ProfileResult* output_profile_result) {
+  
+  ScopedTensorDescriptor x_nd{
+      parent_, x_descriptor,
+      static_cast<miopenDataType_t>(miopen_type)};
+
+  ScopedTensorDescriptor scale_offset_mean_variance_nd{parent_, scale_offset_mean_variance_descriptor,
+                                 static_cast<miopenDataType_t>(miopen_type)};
+
+  ScopedActivationDescriptor activation_desc{parent_, activation_mode};
+
+  ScopedFusionPlanBatchNormActivationInference fusion_plan{
+      parent_,
+      ToHandle(dnn_handle_),
+      x_nd.handle(),
+      scale_offset_mean_variance_nd.handle(),
+      activation_desc.handle()};
+
+  bool retval = false;
+  
+  if (fusion_plan.CompilationSucceeded()) {
+    
+    const bool is_profiling = output_profile_result != nullptr;
+
+    std::unique_ptr<ROCMTimer> timer;
+    if (is_profiling) {
+      timer.reset(new ROCMTimer(parent_));
+      timer->Init();
+      timer->Start(AsROCMStream(stream));
+    }
+
+    miopenStatus_t status = miopenStatusSuccess;
+
+    if (status == miopenStatusSuccess) {
+      fusion_plan.SetBatchNormArgs(scale_data.opaque(), offset_data.opaque(), mean_data.opaque(), variance_data.opaque(), epsilon);
+    }
+
+    if (status == miopenStatusSuccess) {
+      status = fusion_plan.SetActivationArgs(activation_desc.handle());
+    }
+
+    if (status == miopenStatusSuccess) {
+      status =
+        fusion_plan.Execute(x_nd.handle(), x_data.opaque(),
+                            x_nd.handle(), y_data->opaque());
+    }
+
+    if (is_profiling) {
+      timer->Stop(AsROCMStream(stream));
+      if (status == miopenStatusSuccess) {
+	output_profile_result->set_elapsed_time_in_ms(
+						      timer->GetElapsedMilliseconds());
+      }
+      timer->Destroy();
+    }
+
+    if (status != miopenStatusSuccess) {
+      // Silently return when we are profiling.
+      if (!is_profiling) {
+	LOG(FATAL) << "failed to enqueue fused-convolution on stream: "
+		   << ToString(status);
+      }
+    }
+
+    retval = true;
+  }
+
+  return retval;
+}
+
+bool MIOpenSupport::DoFusedBatchNormActivationInference(
+    Stream* stream, const dnn::BatchDescriptor& x_descriptor,
+    const DeviceMemory<float>& x_data,
+    const dnn::BatchDescriptor& scale_offset_mean_variance_descriptor,
+    const DeviceMemory<float>& scale_data,
+    const DeviceMemory<float>& offset_data,
+    const DeviceMemory<float>& mean_data,
+    const DeviceMemory<float>& variance_data,
+    double epsilon,
+    dnn::ActivationMode activation_mode,
+    DeviceMemory<float>* y_data,
+    dnn::ProfileResult* output_profile_result) {
+  return DoFusedBatchNormActivationInferenceImpl<float>(
+      stream, miopenFloat, x_descriptor, x_data,
+      scale_offset_mean_variance_descriptor, scale_data,
+      offset_data, mean_data, variance_data, epsilon,
+      activation_mode, y_data,
+      output_profile_result);
+}
+
 }  // namespace rocm
 
 namespace gpu = ::stream_executor;

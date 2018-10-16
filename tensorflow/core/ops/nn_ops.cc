@@ -2487,7 +2487,7 @@ REGISTER_OP("_ROCmFusedBatchNormActivationTraining")
       using shape_inference::ShapeHandle;
       using shape_inference::DimensionHandle;
 
-      VLOG(-1) << "SetShapFn called for _ROCmFusedBatchNormActivation";
+      // VLOG(-1) << "SetShapFn called for _ROCmFusedBatchNormActivation";
       
       return Status::OK();
     })

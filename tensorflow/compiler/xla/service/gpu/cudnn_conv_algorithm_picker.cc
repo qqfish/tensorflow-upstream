@@ -316,7 +316,7 @@ CudnnConvAlgorithmPicker::PickBestAlgorithm(HloCustomCallInstruction* instr) {
   se::dnn::ProfileResult profile_result;
   VLOG(3) << "Auto-tuning for " << instr->ToString();
 
-  bool launch_ok = RunCudnnConvolution(instr, absl::MakeSpan(operand_buffers),
+  bool launch_ok = RunCudnnConv(instr, absl::MakeSpan(operand_buffers),
                                        result_buffer, &scratch_allocator,
                                        &stream, &profile_result)
                        .ok();

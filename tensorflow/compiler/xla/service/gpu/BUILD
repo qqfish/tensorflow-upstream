@@ -701,6 +701,7 @@ cc_library(
         "//tensorflow/compiler/xla/service:call_inliner",
         "//tensorflow/compiler/xla/service:conditional_simplifier",
         "//tensorflow/compiler/xla/service:executable",
+        "//tensorflow/compiler/xla/service:scatter_expander",
         "//tensorflow/compiler/xla/service:flatten_call_graph",
         "//tensorflow/compiler/xla/service:hlo",
         "//tensorflow/compiler/xla/service:hlo_constant_folding",
